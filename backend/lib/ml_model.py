@@ -60,20 +60,22 @@ def extract_features(url: str) -> np.ndarray:
     entropy = calculate_entropy(raw_url)
 
     has_https = 1.0 if url_lower.startswith('https://') else 0.0
-    is_ip = 1.0 if re.search(r'https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower) else 0.0
+    is_ip = 1.0 if re.search(r'https?://(?:[^@/]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower) else 0.0
 
     # Domain & subdomains
-    domain_match = re.search(r'https?://([^/]+)', url_lower)
+    domain_match = re.search(r'https?://(?:[^@/]+@)?([^/:]+)', url_lower)
     domain_str = domain_match.group(1) if domain_match else url_lower
-    num_subdomains = len(domain_str.split('.')) - 1
+    num_subdomains = 0.0 if is_ip else float(max(0, len(domain_str.split('.')) - 1))
 
     # Brand impersonation check
     brand_present = 0.0
-    valid_tlds = [".com", ".org", ".net", ".ai", ".io", ".so", ".us", ".tv", ".co", ".app"]
     for b in TARGET_BRANDS:
         if b in url_lower:
-            # Check if domain_str is actually the official brand domain
-            is_official = any(domain_str == f"{b}{tld}" or domain_str.endswith(f".{b}{tld}") for tld in valid_tlds)
+            # Check if domain_str is actually the official brand domain (e.g. amazon.com, amazon.in, amazon.co.uk)
+            is_susp_tld = any(url_lower.endswith(tld) or (tld + "/") in url_lower or (tld + ":") in url_lower for tld in SUSPICIOUS_TLDS)
+            is_official = (not is_susp_tld) and bool(
+                re.search(r'(?:^|\.)' + re.escape(b) + r'(?:online)?\.[a-z]{2,}(?:\.[a-z]{2,})?$', domain_str)
+            )
             if not is_official:
                 brand_present = 1.0
                 break
