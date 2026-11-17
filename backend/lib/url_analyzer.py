@@ -2,6 +2,7 @@ import re
 import math
 import time
 import socket
+import ipaddress
 import urllib.parse
 import urllib.request
 from typing import List, Dict, Any, Tuple, Optional
@@ -45,34 +46,58 @@ def parse_url_anatomy(raw_url: str) -> Dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
     netloc = parsed.netloc or parsed.path.split('/')[0]
     
-    # Split host and port if any
-    host_parts = netloc.split(':')
-    host = host_parts[0]
-    port = host_parts[1] if len(host_parts) > 1 else ("443" if parsed.scheme == "https" else "80")
-    
-    # Check if host is raw IP
+    # Clean host and extract userinfo if present
+    clean_host = parsed.hostname or (netloc.split('@')[-1].split(':')[0] if '@' in netloc else netloc.split(':')[0])
+    host = clean_host.lower() if clean_host else ""
+    port = str(parsed.port) if parsed.port else ("443" if parsed.scheme == "https" else "80")
+    has_userinfo = bool(parsed.username or ('@' in parsed.netloc and parsed.netloc.split('@')[0]))
+    userinfo = parsed.username or (parsed.netloc.split('@')[0] if '@' in parsed.netloc else "")
+
+    # Check if host is raw IP and whether it is internal/documentation
     is_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host))
-    
+    is_internal_ip = False
+    is_doc_ip = False
+    if is_ip:
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            doc_nets = [
+                ipaddress.ip_network("192.0.2.0/24"),
+                ipaddress.ip_network("198.51.100.0/24"),
+                ipaddress.ip_network("203.0.113.0/24"),
+                ipaddress.ip_network("2001:db8::/32")
+            ]
+            is_doc_ip = any(ip_obj in net for net in doc_nets)
+            is_internal_ip = (
+                ip_obj.is_private or ip_obj.is_loopback or 
+                ip_obj.is_reserved or ip_obj.is_link_local or is_doc_ip
+            )
+        except ValueError:
+            pass
+
     # Subdomain and domain parsing
     domain_parts = host.split('.')
     if is_ip:
         domain = host
         subdomain = ""
         tld = "IP"
+        sld = host
     elif len(domain_parts) >= 2:
-        if len(domain_parts) > 2 and domain_parts[-2] in ["co", "com", "org", "gov", "edu", "net"] and len(domain_parts[-1]) <= 3:
+        if len(domain_parts) > 2 and domain_parts[-2] in ["co", "com", "org", "gov", "edu", "net", "ac", "ne"] and len(domain_parts[-1]) <= 3:
             # e.g. example.co.uk
             tld = f".{domain_parts[-2]}.{domain_parts[-1]}"
             domain = domain_parts[-3] + tld
             subdomain = ".".join(domain_parts[:-3])
+            sld = domain_parts[-3]
         else:
             tld = f".{domain_parts[-1]}"
             domain = f"{domain_parts[-2]}.{domain_parts[-1]}"
             subdomain = ".".join(domain_parts[:-2])
+            sld = domain_parts[-2]
     else:
         domain = host
         subdomain = ""
         tld = ""
+        sld = host
 
     path = parsed.path if parsed.path else "/"
     query = parsed.query
@@ -92,6 +117,7 @@ def parse_url_anatomy(raw_url: str) -> Dict[str, Any]:
         "host": host,
         "domain": domain,
         "subdomain": subdomain,
+        "sld": sld,
         "tld": tld,
         "port": port,
         "path": path,
@@ -104,10 +130,14 @@ def parse_url_anatomy(raw_url: str) -> Dict[str, Any]:
         "entropy": entropy,
         "special_chars_count": special_chars,
         "digits_count": digits_count,
-        "is_ip_host": is_ip
+        "is_ip_host": is_ip,
+        "is_internal_ip": is_internal_ip,
+        "is_doc_ip": is_doc_ip,
+        "has_userinfo": has_userinfo,
+        "userinfo": userinfo
     }
 
-def detect_homoglyphs_and_impersonation(host: str) -> Dict[str, Any]:
+def detect_homoglyphs_and_impersonation(host: str, anatomy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     punycode = host.startswith("xn--") or ".xn--" in host
     decoded_host = host
     if punycode:
@@ -128,25 +158,55 @@ def detect_homoglyphs_and_impersonation(host: str) -> Dict[str, Any]:
             normalized_chars.append(char)
     normalized_host = "".join(normalized_chars).lower()
 
+    if anatomy is None:
+        anatomy = parse_url_anatomy(host)
+
+    sld = anatomy.get("sld", "").lower()
+    subdomain = anatomy.get("subdomain", "").lower()
+    userinfo = anatomy.get("userinfo", "").lower()
+    tld = anatomy.get("tld", "").lower()
+    is_ip = anatomy.get("is_ip_host", False)
+
     # Brand matching
     impersonated_brand = None
     similarity_score = 0.0
-    
-    clean_host = re.sub(r'[^a-z0-9]', '', normalized_host)
-    
+
     for brand in TARGET_BRANDS:
-        if brand in clean_host:
-            # If the brand is present as a substring but not the actual domain authority
-            if clean_host != brand and not clean_host.endswith(f"{brand}com") and not clean_host.endswith(f"{brand}org"):
+        # 1. Attacker uses userinfo (@ deception) to pretend to be the brand
+        if userinfo and brand in userinfo:
+            impersonated_brand = brand
+            similarity_score = 0.95
+            break
+
+        # 2. Brand present in subdomain, but registered SLD is different
+        if subdomain and (brand in subdomain or brand in subdomain.replace("-", "").replace(".", "")):
+            if sld != brand and not (sld == "microsoftonline" and brand == "microsoft"):
                 impersonated_brand = brand
                 similarity_score = 0.95
                 break
-        else:
-            dist = levenshtein_distance(clean_host[:len(brand)+2], brand)
-            if dist == 1 and len(brand) >= 4:
-                impersonated_brand = brand
-                similarity_score = 0.88
-                break
+
+        # 3. Check registered domain SLD
+        if not is_ip and sld:
+            if sld == brand:
+                # Authentic brand SLD, but registered under suspicious/disposable TLD
+                if any(tld.lower() == stld for stld in SUSPICIOUS_TLDS):
+                    impersonated_brand = brand
+                    similarity_score = 0.90
+                    break
+                # Otherwise, legitimate brand domain on standard or ccTLD (e.g. amazon.com, amazon.in, paypal.com)
+            elif brand in sld:
+                if sld == "microsoftonline" and brand == "microsoft":
+                    pass # Legitimate Microsoft authentication root
+                else:
+                    impersonated_brand = brand
+                    similarity_score = 0.92
+                    break
+            else:
+                dist = levenshtein_distance(sld, brand)
+                if dist == 1 and len(brand) >= 4:
+                    impersonated_brand = brand
+                    similarity_score = 0.88
+                    break
 
     return {
         "is_punycode": punycode,
@@ -160,7 +220,25 @@ def probe_live_url(host: str, normalized_url: str) -> Dict[str, Any]:
     dns_resolved = False
     http_status = None
     ssl_valid = False
-    
+
+    # Skip external network probes for internal, private, loopback, or documentation IPs
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        doc_nets = [
+            ipaddress.ip_network("192.0.2.0/24"),
+            ipaddress.ip_network("198.51.100.0/24"),
+            ipaddress.ip_network("203.0.113.0/24"),
+            ipaddress.ip_network("2001:db8::/32")
+        ]
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local or any(ip_obj in n for n in doc_nets):
+            return {
+                "dns_resolved": True,
+                "http_status": None,
+                "ssl_valid": False
+            }
+    except ValueError:
+        pass
+
     # Fast DNS check
     try:
         ip = socket.gethostbyname(host)
@@ -168,14 +246,14 @@ def probe_live_url(host: str, normalized_url: str) -> Dict[str, Any]:
     except Exception:
         dns_resolved = False
 
-    # Fast HTTP HEAD/GET probe with 1.5s timeout
+    # Fast HTTP HEAD/GET probe with 0.5s timeout to prevent slow blocking
     if dns_resolved:
         try:
             req = urllib.request.Request(
                 normalized_url,
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PhishNexa-Scanner/1.0'}
             )
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
+            with urllib.request.urlopen(req, timeout=0.5) as resp:
                 http_status = resp.status
                 if normalized_url.startswith("https://"):
                     ssl_valid = True
@@ -191,6 +269,7 @@ def probe_live_url(host: str, normalized_url: str) -> Dict[str, Any]:
         "http_status": http_status,
         "ssl_valid": ssl_valid
     }
+
 
 def tokenize_url(raw_url: str, model_name: str = "DistilBERT") -> List[Dict[str, Any]]:
     return ml_engine.tokenize_url(raw_url)
