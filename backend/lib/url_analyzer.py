@@ -277,9 +277,32 @@ def tokenize_url(raw_url: str, model_name: str = "DistilBERT") -> List[Dict[str,
 def evaluate_url(raw_url: str, model_name: str = "DistilBERT") -> Dict[str, Any]:
     start_time = time.time()
     anatomy = parse_url_anatomy(raw_url)
-    homo = detect_homoglyphs_and_impersonation(anatomy["host"])
+    homo = detect_homoglyphs_and_impersonation(anatomy["host"], anatomy)
     tokens = tokenize_url(raw_url, model_name)
     live_probe = probe_live_url(anatomy["host"], anatomy["normalized_url"])
+
+    # Recognized authentic global internet root domains
+    trusted_domains = [
+        "chatgpt.com", "openai.com", "claude.ai", "anthropic.com", "google.com", "youtube.com",
+        "github.com", "gitlab.com", "bitbucket.org", "microsoft.com", "apple.com", "amazon.com",
+        "wikipedia.org", "cloudflare.com", "stackoverflow.com", "mozilla.org", "stripe.com",
+        "huggingface.co", "vercel.app", "vercel.com", "netlify.app", "netlify.com", "pypi.org",
+        "npmjs.com", "w3schools.com", "medium.com", "x.com", "twitter.com", "linkedin.com",
+        "facebook.com", "instagram.com", "reddit.com", "tiktok.com", "whatsapp.com", "telegram.org",
+        "discord.com", "slack.com", "zoom.us", "notion.so", "figma.com", "miro.com", "trello.com",
+        "spotify.com", "netflix.com", "twitch.tv", "adobe.com", "dropbox.com", "google.co.in",
+        "google.co.uk", "bing.com", "duckduckgo.com", "yahoo.com", "paypal.com", "chase.com",
+        "bankofamerica.com", "wellsfargo.com", "citi.com", "binance.com", "coinbase.com",
+        "shopify.com", "dhl.com", "usps.com", "fedex.com", "steamcommunity.com", "steampowered.com", "roblox.com",
+        "microsoftonline.com"
+    ]
+    # Check if domain matches trusted roots or authorized regional ccTLDs of trusted domains
+    trusted_slds = {td.split('.')[0] for td in trusted_domains if '.' in td}
+    is_trusted_root = any(anatomy["domain"].lower() == td or anatomy["domain"].lower().endswith("." + td) for td in trusted_domains)
+    if not is_trusted_root and anatomy.get("sld", "").lower() in trusted_slds:
+        # Regional ccTLD check (e.g. amazon.in, google.de, paypal.ca) when not using a suspicious disposable TLD
+        if not any(anatomy["tld"].lower() == stld for stld in SUSPICIOUS_TLDS):
+            is_trusted_root = True
 
     # Real ML Model prediction
     ml_res = ml_engine.predict_url(raw_url)
@@ -287,18 +310,41 @@ def evaluate_url(raw_url: str, model_name: str = "DistilBERT") -> Dict[str, Any]
 
     indicators = []
     risk_points = int(round(ml_prob * 60)) # Base score from trained ML model
-    
-    # 1. Check IP Host
-    if anatomy["is_ip_host"]:
+
+    # Check for Userinfo / @ Credential Obfuscation
+    if anatomy.get("has_userinfo"):
         risk_points += 35
         indicators.append({
-            "id": "ip_host",
-            "title": "Direct IP Address Host",
-            "severity": "HIGH",
+            "id": "userinfo_deception",
+            "title": "Credential / Userinfo URL Masking (@)",
+            "severity": "CRITICAL",
             "weight": 35,
-            "description": "Legitimate websites rarely use raw IP addresses in public customer links.",
-            "recommendation": "Avoid interacting with IP-hosted login portals."
+            "description": "Adversaries embed deceptive domain names before '@' to disguise destination host.",
+            "recommendation": "Do not trust domain names preceding '@' in URL strings."
         })
+
+    # 1. Check IP Host
+    if anatomy["is_ip_host"]:
+        if anatomy.get("is_internal_ip") or anatomy.get("is_doc_ip"):
+            risk_points += 20
+            indicators.append({
+                "id": "ip_host_internal",
+                "title": "Private / Documentation IP Host",
+                "severity": "MEDIUM",
+                "weight": 20,
+                "description": "Host resolves to an internal private network or RFC 5737 testbed/documentation range.",
+                "recommendation": "Verify whether this internal portal or testbed host is authorized."
+            })
+        else:
+            risk_points += 30
+            indicators.append({
+                "id": "ip_host",
+                "title": "Direct IP Address Host",
+                "severity": "HIGH",
+                "weight": 30,
+                "description": "Legitimate websites rarely use raw IP addresses in public customer links.",
+                "recommendation": "Avoid interacting with IP-hosted login portals."
+            })
 
     # 2. Check Protocol
     if not anatomy["has_https"]:
@@ -349,7 +395,7 @@ def evaluate_url(raw_url: str, model_name: str = "DistilBERT") -> Dict[str, Any]
             "description": "Presence of multiple sensitive keywords (login, verify, update, account) in unusual positions.",
             "recommendation": "Inspect whether the login path belongs to the official verified domain."
         })
-    elif len(matched_keywords) == 1 and not (anatomy["domain"].startswith("google.") or anatomy["domain"].startswith("github.")):
+    elif len(matched_keywords) == 1 and not (is_trusted_root and anatomy["has_https"] and not homo["impersonated_brand"]):
         risk_points += 10
         indicators.append({
             "id": "single_keyword",
@@ -371,22 +417,6 @@ def evaluate_url(raw_url: str, model_name: str = "DistilBERT") -> Dict[str, Any]
             "description": "Adversaries nest multiple subdomains to obfuscate the real root domain on mobile screens.",
             "recommendation": "Read domain from right to left to locate actual top-level authority."
         })
-
-    # List of recognized authentic global internet root domains
-    trusted_domains = [
-        "chatgpt.com", "openai.com", "claude.ai", "anthropic.com", "google.com", "youtube.com",
-        "github.com", "gitlab.com", "bitbucket.org", "microsoft.com", "apple.com", "amazon.com",
-        "wikipedia.org", "cloudflare.com", "stackoverflow.com", "mozilla.org", "stripe.com",
-        "huggingface.co", "vercel.app", "vercel.com", "netlify.app", "netlify.com", "pypi.org",
-        "npmjs.com", "w3schools.com", "medium.com", "x.com", "twitter.com", "linkedin.com",
-        "facebook.com", "instagram.com", "reddit.com", "tiktok.com", "whatsapp.com", "telegram.org",
-        "discord.com", "slack.com", "zoom.us", "notion.so", "figma.com", "miro.com", "trello.com",
-        "spotify.com", "netflix.com", "twitch.tv", "adobe.com", "dropbox.com", "google.co.in",
-        "google.co.uk", "bing.com", "duckduckgo.com", "yahoo.com", "paypal.com", "chase.com",
-        "bankofamerica.com", "wellsfargo.com", "citi.com", "binance.com", "coinbase.com",
-        "shopify.com", "dhl.com", "usps.com", "fedex.com", "steamcommunity.com", "steampowered.com", "roblox.com"
-    ]
-    is_trusted_root = any(anatomy["domain"].lower() == td or anatomy["domain"].lower().endswith("." + td) for td in trusted_domains)
 
     # 7. High Entropy or Length (only on unverified / untrusted domains)
     if not is_trusted_root and (anatomy["entropy"] > 4.5 or anatomy["url_length"] > 95):
@@ -411,6 +441,19 @@ def evaluate_url(raw_url: str, model_name: str = "DistilBERT") -> Dict[str, Any]
             "description": f"The top-level domain '{anatomy['tld']}' has elevated statistical correlation with disposable spam/phishing campaigns.",
             "recommendation": "Exercise extra scrutiny on non-standard registrar extensions."
         })
+
+    # Distinguish suspicious IP-based URL structures from verified malicious activity
+    if anatomy["is_ip_host"]:
+        has_verified_malicious = bool(
+            homo.get("impersonated_brand") or
+            anatomy.get("has_userinfo") or
+            homo.get("has_homoglyphs") or
+            homo.get("is_punycode") or
+            len(matched_keywords) >= 2
+        )
+        if not has_verified_malicious:
+            # IP without brand impersonation or active attack payload is SUSPICIOUS, not confirmed PHISHING
+            risk_points = min(risk_points, 52)
 
     # Safe legitimate baseline discounts for verified trusted root domains
     if is_trusted_root and not homo["has_homoglyphs"] and not homo["is_punycode"] and not homo["impersonated_brand"] and anatomy["has_https"] and not anatomy["is_ip_host"]:
