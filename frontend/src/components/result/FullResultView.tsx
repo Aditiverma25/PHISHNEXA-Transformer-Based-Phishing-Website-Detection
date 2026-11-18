@@ -243,7 +243,14 @@ export function FullResultView({ scan, onResetScan }: FullResultViewProps) {
       <TokenAttentionHeatmap tokens={scan.tokens} modelName={scan.model_name} />
 
       {/* Explainable AI & Counterfactuals */}
-      <ExplainableAi counterfactuals={scan.counterfactuals} />
+      <ExplainableAi
+        counterfactuals={scan.counterfactuals}
+        tokens={scan.tokens}
+        indicators={scan.indicators}
+        anatomy={scan.anatomy}
+        homoglyphAnalysis={scan.homoglyph_analysis}
+        riskScore={scan.risk_score}
+      />
 
       {/* Multi-Model Consensus Breakdown */}
       <ModelComparisonSection
