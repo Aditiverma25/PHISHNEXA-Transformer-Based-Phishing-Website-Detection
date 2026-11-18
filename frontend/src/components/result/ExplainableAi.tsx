@@ -1,18 +1,118 @@
 import { HelpCircle, Sparkles, Sliders, ArrowDownRight } from "lucide-react";
-import type { CounterfactualItem } from "@/types";
+import type { CounterfactualItem, TokenAttentionItem, ThreatIndicatorItem, URLAnatomy, HomoglyphAnalysis } from "@/types";
+import { useMemo } from "react";
 
 interface ExplainableAiProps {
   counterfactuals: CounterfactualItem[];
+  tokens?: TokenAttentionItem[];
+  indicators?: ThreatIndicatorItem[];
+  anatomy?: URLAnatomy;
+  homoglyphAnalysis?: HomoglyphAnalysis;
+  riskScore?: number;
 }
 
-export function ExplainableAi({ counterfactuals }: ExplainableAiProps) {
-  const featureWeights = [
-    { label: "Transformer Contextual Token Attention", pct: 88, desc: "Learned bidirectional representations" },
-    { label: "Targeted Brand Impersonation Proximity", pct: 82, desc: "Levenshtein distance vs trusted brands" },
-    { label: "Punycode & Homoglyph Anomaly", pct: 76, desc: "Lookalike Unicode glyph analysis" },
-    { label: "Subdomain Depth & Path Obfuscation", pct: 71, desc: "Hierarchy nesting & redirection patterns" },
-    { label: "Lexical & Character Entropy", pct: 64, desc: "Randomness index across token tree" }
-  ];
+function clamp(val: number, min = 0, max = 100): number {
+  return Math.round(Math.max(min, Math.min(max, val)));
+}
+
+export function ExplainableAi({ counterfactuals, tokens, indicators, anatomy, homoglyphAnalysis, riskScore }: ExplainableAiProps) {
+  const featureWeights = useMemo(() => {
+    // --- 1. Transformer Contextual Token Attention ---
+    // Average attention weight of suspicious tokens, scaled to 0-100
+    let tokenAttentionPct = 12; // low default for legitimate
+    if (tokens && tokens.length > 0) {
+      const suspiciousTokens = tokens.filter(t => t.is_suspicious);
+      if (suspiciousTokens.length > 0) {
+        const avgSuspiciousWeight = suspiciousTokens.reduce((s, t) => s + t.attention_weight, 0) / suspiciousTokens.length;
+        // attention_weight is typically 0.0-1.0; scale and boost by suspicious ratio
+        const suspiciousRatio = suspiciousTokens.length / tokens.length;
+        tokenAttentionPct = clamp(avgSuspiciousWeight * 100 * (0.5 + suspiciousRatio));
+      } else {
+        // No suspicious tokens — low contribution
+        const avgWeight = tokens.reduce((s, t) => s + t.attention_weight, 0) / tokens.length;
+        tokenAttentionPct = clamp(avgWeight * 30); // scale down for non-suspicious
+      }
+    }
+
+    // --- 2. Targeted Brand Impersonation Proximity ---
+    let brandPct = 5; // low default
+    if (homoglyphAnalysis) {
+      if (homoglyphAnalysis.impersonated_brand) {
+        // If a brand is being impersonated, similarity_score drives this (0.0-1.0)
+        brandPct = clamp(homoglyphAnalysis.similarity_score * 100);
+      } else {
+        brandPct = clamp(homoglyphAnalysis.similarity_score * 20); // minimal if no impersonation
+      }
+    }
+    // Also check indicators for brand_impersonation evidence
+    if (indicators) {
+      const brandIndicator = indicators.find(i => i.id === "brand_impersonation" || i.id === "suspicious_keywords");
+      if (brandIndicator) {
+        brandPct = clamp(Math.max(brandPct, brandIndicator.weight * 10));
+      }
+    }
+
+    // --- 3. Punycode & Homoglyph Anomaly ---
+    let punycodePct = 3; // low default
+    if (homoglyphAnalysis) {
+      if (homoglyphAnalysis.has_homoglyphs) {
+        punycodePct = clamp(75 + homoglyphAnalysis.similarity_score * 25);
+      } else if (homoglyphAnalysis.is_punycode) {
+        punycodePct = clamp(60);
+      }
+    }
+
+    // --- 4. Subdomain Depth & Path Obfuscation ---
+    let subdomainPct = 5; // low default
+    if (anatomy) {
+      // Count subdomain depth (dots in subdomain)
+      const subdomainDepth = anatomy.subdomain && anatomy.subdomain !== "(None)" && anatomy.subdomain !== ""
+        ? anatomy.subdomain.split(".").filter(Boolean).length
+        : 0;
+      const pathScore = Math.min(anatomy.path_length / 50, 1) * 30; // long paths are suspicious
+      const subdomainScore = Math.min(subdomainDepth / 3, 1) * 50;
+      subdomainPct = clamp(subdomainScore + pathScore);
+
+      // Boost from indicators
+      if (indicators) {
+        const subIndicator = indicators.find(i => i.id === "subdomain_depth" || i.id === "excessive_subdomains");
+        if (subIndicator) {
+          subdomainPct = clamp(Math.max(subdomainPct, subIndicator.weight * 10));
+        }
+      }
+    }
+
+    // --- 5. Lexical & Character Entropy ---
+    let entropyPct = 8; // low default
+    if (anatomy) {
+      // Typical entropy range: 2.0 (simple) to 5.0+ (random/suspicious)
+      // Map: 2.0 → ~10%, 3.5 → ~40%, 4.5+ → ~80%+
+      const entropy = anatomy.entropy || 0;
+      if (entropy > 0) {
+        entropyPct = clamp(((entropy - 1.5) / 3.5) * 100);
+      }
+      // Special chars also contribute
+      const specialCharBoost = Math.min(anatomy.special_chars_count / 10, 1) * 20;
+      entropyPct = clamp(entropyPct + specialCharBoost);
+    }
+
+    // If we have a risk score, slightly calibrate values toward it for consistency
+    if (riskScore !== undefined) {
+      const riskFactor = riskScore / 100;
+      // Nudge values toward being consistent with overall risk
+      tokenAttentionPct = clamp(tokenAttentionPct * (0.6 + riskFactor * 0.6));
+      brandPct = clamp(brandPct * (0.5 + riskFactor * 0.8));
+      subdomainPct = clamp(subdomainPct * (0.5 + riskFactor * 0.8));
+    }
+
+    return [
+      { label: "Transformer Contextual Token Attention", pct: tokenAttentionPct, desc: "Learned bidirectional representations" },
+      { label: "Targeted Brand Impersonation Proximity", pct: brandPct, desc: "Levenshtein distance vs trusted brands" },
+      { label: "Punycode & Homoglyph Anomaly", pct: punycodePct, desc: "Lookalike Unicode glyph analysis" },
+      { label: "Subdomain Depth & Path Obfuscation", pct: subdomainPct, desc: "Hierarchy nesting & redirection patterns" },
+      { label: "Lexical & Character Entropy", pct: entropyPct, desc: "Randomness index across token tree" }
+    ];
+  }, [tokens, indicators, anatomy, homoglyphAnalysis, riskScore]);
 
   return (
     <div
